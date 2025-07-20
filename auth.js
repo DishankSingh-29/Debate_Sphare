@@ -1,295 +1,418 @@
-const jwt = require('jsonwebtoken');
-const User = require('../models/User');
-const logger = require('../config/logger');
+const express = require('express');
+const passport = require('passport');
+const rateLimit = require('express-rate-limit');
+const { catchAsync } = require('../middleware/errorHandler');
+const { protect, authRateLimit } = require('../middleware/auth');
+const {
+  validateRegistration,
+  validateLogin,
+  validatePasswordReset,
+  validateNewPassword
+} = require('../middleware/validation');
+const authController = require('../controllers/authController');
+
+const router = express.Router();
 
 /**
- * Protect routes - Verify JWT token and authenticate user
+ * @swagger
+ * components:
+ *   schemas:
+ *     UserRegistration:
+ *       type: object
+ *       required:
+ *         - name
+ *         - email
+ *         - password
+ *       properties:
+ *         name:
+ *           type: string
+ *           description: User's full name
+ *         email:
+ *           type: string
+ *           format: email
+ *           description: User's email address
+ *         password:
+ *           type: string
+ *           description: User's password
+ *     UserLogin:
+ *       type: object
+ *       required:
+ *         - email
+ *         - password
+ *       properties:
+ *         email:
+ *           type: string
+ *           format: email
+ *         password:
+ *           type: string
+ *     PasswordReset:
+ *       type: object
+ *       required:
+ *         - email
+ *       properties:
+ *         email:
+ *           type: string
+ *           format: email
  */
-const protect = async (req, res, next) => {
-  let token;
-
-  // Check for token in headers
-  if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
-    token = req.headers.authorization.split(' ')[1];
-  }
-
-  // Check if token exists
-  if (!token) {
-    return res.status(401).json({
-      success: false,
-      error: 'Not authorized to access this route. No token provided.'
-    });
-  }
-
-  try {
-    // Verify token
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    // Get user from token
-    const user = await User.findById(decoded.id).select('-password');
-
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        error: 'User not found with this token.'
-      });
-    }
-
-    // Check if user is active
-    if (!user.isActive) {
-      return res.status(401).json({
-        success: false,
-        error: 'User account is deactivated.'
-      });
-    }
-
-    // Add user to request object
-    req.user = user;
-    next();
-  } catch (error) {
-    logger.error('Token verification failed:', error.message);
-    
-    if (error.name === 'JsonWebTokenError') {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid token.'
-      });
-    }
-    
-    if (error.name === 'TokenExpiredError') {
-      return res.status(401).json({
-        success: false,
-        error: 'Token has expired.'
-      });
-    }
-
-    return res.status(500).json({
-      success: false,
-      error: 'Token verification failed.'
-    });
-  }
-};
 
 /**
- * Optional authentication - Verify JWT token if provided but don't require it
+ * @swagger
+ * /api/auth/register:
+ *   post:
+ *     summary: Register a new user
+ *     tags: [Authentication]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/UserRegistration'
+ *     responses:
+ *       201:
+ *         description: User registered successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     user:
+ *                       $ref: '#/components/schemas/User'
+ *                     token:
+ *                       type: string
+ *       400:
+ *         description: Validation error
+ *       409:
+ *         description: User already exists
  */
-const optionalAuth = async (req, res, next) => {
-  let token;
-
-  // Check for token in headers
-  if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
-    token = req.headers.authorization.split(' ')[1];
-  }
-
-  // If no token, continue without authentication
-  if (!token) {
-    req.user = null;
-    return next();
-  }
-
-  try {
-    // Verify token
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    // Get user from token
-    const user = await User.findById(decoded.id).select('-password');
-
-    if (!user || !user.isActive) {
-      req.user = null;
-      return next();
-    }
-
-    // Add user to request object
-    req.user = user;
-    next();
-  } catch (error) {
-    // If token is invalid, continue without authentication
-    req.user = null;
-    next();
-  }
-};
+router.post('/register', 
+  rateLimit(authRateLimit),
+  validateRegistration,
+  catchAsync(authController.register)
+);
 
 /**
- * Refresh token middleware
+ * @swagger
+ * /api/auth/login:
+ *   post:
+ *     summary: Login user
+ *     tags: [Authentication]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/UserLogin'
+ *     responses:
+ *       200:
+ *         description: Login successful
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     user:
+ *                       $ref: '#/components/schemas/User'
+ *                     token:
+ *                       type: string
+ *                     refreshToken:
+ *                       type: string
+ *       401:
+ *         description: Invalid credentials
  */
-const refreshToken = async (req, res, next) => {
-  let token;
-
-  // Check for refresh token in headers
-  if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
-    token = req.headers.authorization.split(' ')[1];
-  }
-
-  if (!token) {
-    return res.status(401).json({
-      success: false,
-      error: 'Refresh token not provided.'
-    });
-  }
-
-  try {
-    // Verify refresh token
-    const decoded = jwt.verify(token, process.env.JWT_REFRESH_SECRET);
-
-    // Get user
-    const user = await User.findById(decoded.id).select('-password');
-
-    if (!user || !user.isActive) {
-      return res.status(401).json({
-        success: false,
-        error: 'User not found or inactive.'
-      });
-    }
-
-    // Generate new access token
-    const newAccessToken = user.getSignedJwtToken();
-    const newRefreshToken = user.getRefreshToken();
-
-    req.user = user;
-    req.newAccessToken = newAccessToken;
-    req.newRefreshToken = newRefreshToken;
-    next();
-  } catch (error) {
-    logger.error('Refresh token verification failed:', error.message);
-    
-    return res.status(401).json({
-      success: false,
-      error: 'Invalid or expired refresh token.'
-    });
-  }
-};
+router.post('/login',
+  rateLimit(authRateLimit),
+  validateLogin,
+  catchAsync(authController.login)
+);
 
 /**
- * Role-based authorization middleware
+ * @swagger
+ * /api/auth/logout:
+ *   post:
+ *     summary: Logout user
+ *     tags: [Authentication]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Logout successful
  */
-const authorize = (...roles) => {
-  return (req, res, next) => {
-    if (!req.user) {
-      return res.status(401).json({
-        success: false,
-        error: 'User not authenticated.'
-      });
-    }
-
-    if (!roles.includes(req.user.role)) {
-      return res.status(403).json({
-        success: false,
-        error: `User role '${req.user.role}' is not authorized to access this route.`
-      });
-    }
-
-    next();
-  };
-};
-
-/**
- * Skill level authorization middleware
- */
-const requireSkillLevel = (minSkillLevel) => {
-  const skillLevels = ['beginner', 'intermediate', 'advanced', 'expert'];
-  
-  return (req, res, next) => {
-    if (!req.user) {
-      return res.status(401).json({
-        success: false,
-        error: 'User not authenticated.'
-      });
-    }
-
-    const userSkillIndex = skillLevels.indexOf(req.user.skillLevel);
-    const requiredSkillIndex = skillLevels.indexOf(minSkillLevel);
-
-    if (userSkillIndex < requiredSkillIndex) {
-      return res.status(403).json({
-        success: false,
-        error: `This feature requires at least '${minSkillLevel}' skill level. Your current level is '${req.user.skillLevel}'.`
-      });
-    }
-
-    next();
-  };
-};
-
-/**
- * Rate limiting for authentication attempts
- */
-const authRateLimit = {
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // limit each IP to 5 requests per windowMs
-  message: {
-    success: false,
-    error: 'Too many authentication attempts. Please try again later.'
-  },
-  standardHeaders: true,
-  legacyHeaders: false,
-};
-
-/**
- * Check if user has completed email verification
- */
-const requireEmailVerification = (req, res, next) => {
-  if (!req.user) {
-    return res.status(401).json({
-      success: false,
-      error: 'User not authenticated.'
-    });
-  }
-
-  if (!req.user.isEmailVerified) {
-    return res.status(403).json({
-      success: false,
-      error: 'Email verification required. Please verify your email address.'
-    });
-  }
-
-  next();
-};
-
-/**
- * Check if user has sufficient debate experience
- */
-const requireDebateExperience = (minDebates = 5) => {
-  return (req, res, next) => {
-    if (!req.user) {
-      return res.status(401).json({
-        success: false,
-        error: 'User not authenticated.'
-      });
-    }
-
-    if (req.user.statistics.totalDebates < minDebates) {
-      return res.status(403).json({
-        success: false,
-        error: `This feature requires at least ${minDebates} completed debates. You have completed ${req.user.statistics.totalDebates} debates.`
-      });
-    }
-
-    next();
-  };
-};
-
-/**
- * Log user activity
- */
-const logUserActivity = (req, res, next) => {
-  if (req.user) {
-    // Update last login time
-    User.findByIdAndUpdate(req.user._id, { lastLogin: new Date() })
-      .catch(error => logger.error('Failed to update last login:', error));
-    
-    logger.info(`User activity: ${req.user.email} - ${req.method} ${req.originalUrl}`);
-  }
-  next();
-};
-
-module.exports = {
+router.post('/logout',
   protect,
-  optionalAuth,
-  refreshToken,
-  authorize,
-  requireSkillLevel,
-  authRateLimit,
-  requireEmailVerification,
-  requireDebateExperience,
-  logUserActivity
-}; 
+  catchAsync(authController.logout)
+);
+
+/**
+ * @swagger
+ * /api/auth/refresh:
+ *   post:
+ *     summary: Refresh access token
+ *     tags: [Authentication]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Token refreshed successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     token:
+ *                       type: string
+ *                     refreshToken:
+ *                       type: string
+ *       401:
+ *         description: Invalid refresh token
+ */
+router.post('/refresh',
+  protect,
+  catchAsync(authController.refreshToken)
+);
+
+/**
+ * @swagger
+ * /api/auth/me:
+ *   get:
+ *     summary: Get current user
+ *     tags: [Authentication]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Current user data
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   $ref: '#/components/schemas/User'
+ *       401:
+ *         description: Not authenticated
+ */
+router.get('/me',
+  protect,
+  catchAsync(authController.getMe)
+);
+
+/**
+ * @swagger
+ * /api/auth/forgot-password:
+ *   post:
+ *     summary: Send password reset email
+ *     tags: [Authentication]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/PasswordReset'
+ *     responses:
+ *       200:
+ *         description: Password reset email sent
+ *       404:
+ *         description: User not found
+ */
+router.post('/forgot-password',
+  rateLimit(authRateLimit),
+  validatePasswordReset,
+  catchAsync(authController.forgotPassword)
+);
+
+/**
+ * @swagger
+ * /api/auth/reset-password/{token}:
+ *   post:
+ *     summary: Reset password with token
+ *     tags: [Authentication]
+ *     parameters:
+ *       - in: path
+ *         name: token
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - password
+ *               - confirmPassword
+ *             properties:
+ *               password:
+ *                 type: string
+ *               confirmPassword:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Password reset successful
+ *       400:
+ *         description: Invalid or expired token
+ */
+router.post('/reset-password/:token',
+  validateNewPassword,
+  catchAsync(authController.resetPassword)
+);
+
+/**
+ * @swagger
+ * /api/auth/verify-email/{token}:
+ *   post:
+ *     summary: Verify email address
+ *     tags: [Authentication]
+ *     parameters:
+ *       - in: path
+ *         name: token
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Email verified successfully
+ *       400:
+ *         description: Invalid or expired token
+ */
+router.post('/verify-email/:token',
+  catchAsync(authController.verifyEmail)
+);
+
+/**
+ * @swagger
+ * /api/auth/resend-verification:
+ *   post:
+ *     summary: Resend email verification
+ *     tags: [Authentication]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Verification email sent
+ *       400:
+ *         description: Email already verified
+ */
+router.post('/resend-verification',
+  protect,
+  catchAsync(authController.resendVerification)
+);
+
+/**
+ * @swagger
+ * /api/auth/google:
+ *   get:
+ *     summary: Google OAuth login
+ *     tags: [Authentication]
+ *     responses:
+ *       302:
+ *         description: Redirect to Google OAuth
+ */
+router.get('/google',
+  passport.authenticate('google', {
+    scope: ['profile', 'email']
+  })
+);
+
+/**
+ * @swagger
+ * /api/auth/google/callback:
+ *   get:
+ *     summary: Google OAuth callback
+ *     tags: [Authentication]
+ *     responses:
+ *       200:
+ *         description: OAuth login successful
+ *       401:
+ *         description: OAuth authentication failed
+ */
+router.get('/google/callback',
+  passport.authenticate('google', { session: false }),
+  catchAsync(authController.googleCallback)
+);
+
+/**
+ * @swagger
+ * /api/auth/change-password:
+ *   post:
+ *     summary: Change password
+ *     tags: [Authentication]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - currentPassword
+ *               - newPassword
+ *               - confirmPassword
+ *             properties:
+ *               currentPassword:
+ *                 type: string
+ *               newPassword:
+ *                 type: string
+ *               confirmPassword:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Password changed successfully
+ *       400:
+ *         description: Current password incorrect
+ */
+router.post('/change-password',
+  protect,
+  validateNewPassword,
+  catchAsync(authController.changePassword)
+);
+
+/**
+ * @swagger
+ * /api/auth/delete-account:
+ *   delete:
+ *     summary: Delete user account
+ *     tags: [Authentication]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - password
+ *             properties:
+ *               password:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Account deleted successfully
+ *       400:
+ *         description: Password incorrect
+ */
+router.delete('/delete-account',
+  protect,
+  catchAsync(authController.deleteAccount)
+);
+
+module.exports = router; 
